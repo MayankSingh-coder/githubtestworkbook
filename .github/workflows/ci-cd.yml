@@ -13,41 +13,25 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
       
-      - name: Check secrets (REMOVE AFTER TESTING)
-        run: |
-          if [ -z "${{ secrets.GCP_PROJECT_ID }}" ]; then
-            echo "❌ GCP_PROJECT_ID secret is empty"
-          else
-            echo "✅ GCP_PROJECT_ID is set"
-          fi
-          
-          if [ -z "${{ secrets.SERVICE_ACCOUNT_KEY }}" ]; then
-            echo "❌ SERVICE_ACCOUNT_KEY secret is empty"
-          else
-            echo "✅ SERVICE_ACCOUNT_KEY is set (length: ${#SERVICE_KEY})"
-          fi
-        env:
-          SERVICE_KEY: ${{ secrets.SERVICE_ACCOUNT_KEY }}
-      
-      - name: Set up gcloud CLI
-        uses: google-github-actions/setup-gcloud@v1
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
         with:
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-          service_account_key: ${{ secrets.SERVICE_ACCOUNT_KEY }}
-          export_default_credentials: true
+          credentials_json: ${{ secrets.SERVICE_ACCOUNT_KEY }}
       
       - name: Set up gcloud CLI
         uses: google-github-actions/setup-gcloud@v2
       
-      - name: Verify gcloud configuration
+      - name: Configure gcloud and verify authentication
         run: |
+          gcloud config set project ${{ secrets.GCP_PROJECT_ID }}
           gcloud config list
           gcloud auth list
       
       - name: Copy files to GCP VM
         run: |
-          # Accept SSH key generation automatically
-          yes | gcloud compute scp --recurse ./ \
+          # Create SSH directory and accept prompts automatically
+          mkdir -p ~/.ssh
+          echo "y" | gcloud compute scp --recurse ./ \
             tanmaymi251@ubuntu-4gb:~/test \
-            --zone=us-central1-c
-            
+            --zone=us-central1-c \
+            --ssh-key-expire-after=1h
