@@ -1,57 +1,127 @@
 name: Deploy to GCP VM
-
 on:
   push:
     branches:
       - main
+  workflow_dispatch: # Allow manual triggers
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v4
       
-      - name: Authenticate to Google Cloud
-        run: |
-          echo '${{ secrets.SERVICE_ACCOUNT_KEY }}' > gcp-key.json
-          gcloud auth activate-service-account --key-file=gcp-key.json
-          rm gcp-key.json
-      
-      - name: Set up gcloud CLI
-        uses: google-github-actions/setup-gcloud@v2
-      
-      - name: Configure gcloud and verify authentication
-        run: |
-          gcloud config set project ${{ secrets.GCP_PROJECT_ID }}
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.SERVICE_ACCOUNT_KEY }}
+        
+    - name: Set up gcloud CLI
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+        
+    - name: Verify authentication and configuration
+      run: |
+        echo "=== Current gcloud configuration ==="
+        gcloud config list
+        echo "=== Authenticated accounts ==="
+        gcloud auth list
+        echo "=== Testing authentication ==="
+        gcloud projects describe ${{ secrets.GCP_PROJECT_ID }}
+        
+    - name: Prepare deployment package
+      run: |
+        # Create a deployment directory
+        mkdir -p deployment
+        
+        # Copy application files (adjust paths as needed)
+        cp -r . deployment/
+        
+        # Remove unnecessary files
+        rm -rf deployment/.git
+        rm -rf deployment/.github
+        rm -rf deployment/node_modules || true
+        rm -rf deployment/.env* || true
+        
+        # Create deployment timestamp
+        echo "DEPLOY_TIME=$(date -u +%Y%m%d_%H%M%S)" >> deployment/deploy_info.txt
+        echo "COMMIT_SHA=${{ github.sha }}" >> deployment/deploy_info.txt
+        echo "BRANCH=${{ github.ref_name }}" >> deployment/deploy_info.txt
+        
+    - name: Copy files to GCP VM
+      run: |
+        # Ensure VM is running
+        echo "=== Checking VM status ==="
+        VM_STATUS=$(gcloud compute instances describe ubuntu-4gb \
+          --zone=us-central1-c \
+          --format="value(status)")
+        echo "VM Status: $VM_STATUS"
+        
+        if [ "$VM_STATUS" != "RUNNING" ]; then
+          echo "Starting VM..."
+          gcloud compute instances start ubuntu-4gb --zone=us-central1-c
           
-          echo "=== All authenticated accounts ==="
-          gcloud auth list
+          # Wait for VM to be ready
+          echo "Waiting for VM to be ready..."
+          sleep 30
+        fi
+        
+        # Create target directory on VM
+        gcloud compute ssh tanmaymi251@ubuntu-4gb \
+          --zone=us-central1-c \
+          --ssh-key-expire-after=1h \
+          --command="mkdir -p ~/app/releases/$(date +%Y%m%d_%H%M%S)"
+        
+        # Copy deployment package
+        echo "=== Copying files to VM ==="
+        gcloud compute scp --recurse deployment/ \
+          tanmaymi251@ubuntu-4gb:~/app/current \
+          --zone=us-central1-c \
+          --ssh-key-expire-after=1h
           
-          echo "=== Active accounts only ==="
-          gcloud auth list --filter=status:ACTIVE --format="value(account)"
+    - name: Run deployment script on VM
+      run: |
+        echo "=== Running deployment script ==="
+        gcloud compute ssh tanmaymi251@ubuntu-4gb \
+          --zone=us-central1-c \
+          --ssh-key-expire-after=1h \
+          --command="
+            cd ~/app/current &&
+            chmod +x deploy.sh &&
+            ./deploy.sh
+          "
           
-          # Set the active account explicitly
-          ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" | head -1)
-          if [ ! -z "$ACTIVE_ACCOUNT" ]; then
-            gcloud config set account $ACTIVE_ACCOUNT
-            echo "Set active account: $ACTIVE_ACCOUNT"
-            
-            echo "=== Final gcloud config ==="
-            gcloud config list
-          else
-            echo "❌ No active account found"
-            echo "All accounts:"
-            gcloud auth list
-            exit 1
-          fi
-      
-      - name: Copy files to GCP VM
-        run: |
-          # Create SSH directory and accept prompts automatically
-          mkdir -p ~/.ssh
-          echo "y" | gcloud compute scp --recurse ./ \
-            tanmaymi251@ubuntu-4gb:~/test \
-            --zone=us-central1-c \
-            --ssh-key-expire-after=1h
+    - name: Verify deployment
+      run: |
+        echo "=== Verifying deployment ==="
+        gcloud compute ssh tanmaymi251@ubuntu-4gb \
+          --zone=us-central1-c \
+          --ssh-key-expire-after=1h \
+          --command="
+            cd ~/app/current &&
+            if [ -f health_check.sh ]; then
+              chmod +x health_check.sh &&
+              ./health_check.sh
+            else
+              echo 'No health check script found, deployment completed'
+            fi
+          "
+          
+    - name: Cleanup on failure
+      if: failure()
+      run: |
+        echo "=== Deployment failed, running cleanup ==="
+        gcloud compute ssh tanmaymi251@ubuntu-4gb \
+          --zone=us-central1-c \
+          --ssh-key-expire-after=1h \
+          --command="
+            if [ -d ~/app/previous ]; then
+              echo 'Restoring previous version...'
+              rm -rf ~/app/current
+              mv ~/app/previous ~/app/current
+              cd ~/app/current && ./start.sh || echo 'Failed to start previous version'
+            fi
+          " || echo "Cleanup failed or VM not accessible"
